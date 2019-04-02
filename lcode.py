@@ -687,27 +687,6 @@ def move_smart_kernel(xi_step_size, reflect_boundary,
 
     px, py, pz = opx + dpx, opy + dpy, opz + dpz
 
-    # Reflect the particles from `+-reflect_boundary`.
-    # TODO: avoid branching?
-    x = x_init[k] + x_offt
-    y = y_init[k] + y_offt
-    if x > +reflect_boundary:
-        x = +2 * reflect_boundary - x
-        x_offt = x - x_init[k]
-        px = -px
-    if x < -reflect_boundary:
-        x = -2 * reflect_boundary - x
-        x_offt = x - x_init[k]
-        px = -px
-    if y > +reflect_boundary:
-        y = +2 * reflect_boundary - y
-        y_offt = y - y_init[k]
-        py = -py
-    if y < -reflect_boundary:
-        y = -2 * reflect_boundary - y
-        y_offt = y - y_init[k]
-        py = -py
-
     # Save the results into the output arrays  # TODO: get rid of that
     new_x_offt[k], new_y_offt[k] = x_offt, y_offt
     new_px[k], new_py[k], new_pz[k] = px, py, pz
@@ -723,11 +702,11 @@ def move_smart(config,
     and the the best estimation of its next location currently available to us.
     This is a convenience wrapper around the `move_smart_kernel` CUDA kernel.
     """
-    x_offt_new = cp.zeros_like(x_prev_offt)
-    y_offt_new = cp.zeros_like(y_prev_offt)
-    px_new = cp.zeros_like(px_prev)
-    py_new = cp.zeros_like(py_prev)
-    pz_new = cp.zeros_like(pz_prev)
+    x_offt = cp.zeros_like(x_prev_offt)
+    y_offt = cp.zeros_like(y_prev_offt)
+    px = cp.zeros_like(px_prev)
+    py = cp.zeros_like(py_prev)
+    pz = cp.zeros_like(pz_prev)
     cfg = int(np.ceil(x_init.size / WARP_SIZE)), WARP_SIZE
     move_smart_kernel[cfg](config.xi_step_size, config.reflect_boundary,
                            config.grid_step_size, config.grid_steps,
@@ -737,10 +716,28 @@ def move_smart(config,
                            estimated_x_offt.ravel(), estimated_y_offt.ravel(),
                            px_prev.ravel(), py_prev.ravel(), pz_prev.ravel(),
                            Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
-                           x_offt_new.ravel(), y_offt_new.ravel(),
-                           px_new.ravel(), py_new.ravel(), pz_new.ravel())
+                           x_offt.ravel(), y_offt.ravel(),
+                           px.ravel(), py.ravel(), pz.ravel())
+
+    reflect_boundary = config.reflect_boundary
+    x, y = x_init + x_offt, y_init + y_offt
+    reflect_l, reflect_r = x < -reflect_boundary, x > +reflect_boundary
+    reflect_u, reflect_d = y < -reflect_boundary, y > +reflect_boundary
+    x_offt[reflect_r] = +2 * reflect_boundary - x[reflect_r] - x_init[reflect_r]
+    x_offt[reflect_l] = -2 * reflect_boundary - x[reflect_l] - x_init[reflect_l]
+    y_offt[reflect_u] = +2 * reflect_boundary - y[reflect_u] - y_init[reflect_u]
+    y_offt[reflect_d] = -2 * reflect_boundary - y[reflect_d] - y_init[reflect_d]
+    # If a particle never gets reflected, its offset is never mixed with
+    # [xy]_init, and the float64 precision of the offset is preserved.
+    px[reflect_r] *= -1
+    px[reflect_l] *= -1
+    py[reflect_u] *= -1
+    py[reflect_d] *= -1
+    # If a particle is so fast that it doesn't fit inside the window
+    # after one reflection, the simulation probably has bigger problems by now.
+
     numba.cuda.synchronize()
-    return x_offt_new, y_offt_new, px_new, py_new, pz_new
+    return x_offt, y_offt, px, py, pz
 
 
 # The scheme of a single step in xi #
