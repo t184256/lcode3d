@@ -314,32 +314,7 @@ def move_estimate_wo_fields(config,
 
 # Deposition and interpolation helper functions #
 
-@numba.jit(inline=True)
 def weights(x, y, grid_steps, grid_step_size):
-    """
-    Calculate the indices of a cell corresponding to the coordinates,
-    and the coefficients of interpolation and deposition for this cell
-    and 8 surrounding cells.
-    The weights correspond to 2D triangluar shaped cloud (TSC2D).
-    """
-    x_h, y_h = x / grid_step_size + .5, y / grid_step_size + .5
-    i, j = int(floor(x_h) + grid_steps // 2), int(floor(y_h) + grid_steps // 2)
-    x_loc, y_loc = x_h - floor(x_h) - .5, y_h - floor(y_h) - .5
-    # centered to -.5 to 5, not 0 to 1, as formulas use offset from cell center
-    # TODO: get rid of this deoffsetting/reoffsetting festival
-
-    wx0, wy0 = .75 - x_loc**2, .75 - y_loc**2  # fx1, fy1
-    wxP, wyP = (.5 + x_loc)**2 / 2, (.5 + y_loc)**2 / 2  # fx2**2/2, fy2**2/2
-    wxM, wyM = (.5 - x_loc)**2 / 2, (.5 - y_loc)**2 / 2  # fx3**2/2, fy3**2/2
-
-    wMP, w0P, wPP = wxM * wyP, wx0 * wyP, wxP * wyP
-    wM0, w00, wP0 = wxM * wy0, wx0 * wy0, wxP * wy0
-    wMM, w0M, wPM = wxM * wyM, wx0 * wyM, wxP * wyM
-
-    return i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM
-
-
-def weights_(x, y, grid_steps, grid_step_size):
     """
     Calculate the indices of a cell corresponding to the coordinates,
     and the coefficients of interpolation and deposition for this cell
@@ -364,7 +339,6 @@ def weights_(x, y, grid_steps, grid_step_size):
     return i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM
 
 
-@numba.jit(inline=True)
 def interp9(a, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM):
     """
     Collect value from a cell and 8 surrounding cells (using `weights` output).
@@ -376,25 +350,12 @@ def interp9(a, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM):
     )
 
 
-def interp9_(a, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM):
-    """
-    Collect value from a cell and 8 surrounding cells (using `weights` output).
-    """
-    return (
-        a[i - 1, j + 1] * wMP + a[i + 0, j + 1] * w0P + a[i + 1, j + 1] * wPP +
-        a[i - 1, j + 0] * wM0 + a[i + 0, j + 0] * w00 + a[i + 1, j + 0] * wP0 +
-        a[i - 1, j - 1] * wMM + a[i + 0, j - 1] * w0M + a[i + 1, j - 1] * wPM
-    )
-
-
-@numba.jit(inline=True)
 def deposit9(a, i, j, val, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM):
     """
     Deposit value into a cell and 8 surrounding cells (using `weights` output).
     """
     # This is like a[i - 1, j + 1] += val * wMP, except it is atomic
     # and incrementing the same cell by several threads will add up correctly.
-    # CUDA Compute Capability 6.0+ is recommended for hardware atomics support.
     numba.cuda.atomic.add(a, (i - 1, j + 1), val * wMP)
     numba.cuda.atomic.add(a, (i + 0, j + 1), val * w0P)
     numba.cuda.atomic.add(a, (i + 1, j + 1), val * wPP)
@@ -404,6 +365,7 @@ def deposit9(a, i, j, val, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM):
     numba.cuda.atomic.add(a, (i - 1, j - 1), val * wMM)
     numba.cuda.atomic.add(a, (i + 0, j - 1), val * w0M)
     numba.cuda.atomic.add(a, (i + 1, j - 1), val * wPM)
+
 
 
 # Coarse and fine plasma initialization #
@@ -477,15 +439,15 @@ def plasma_make(steps, cell_size, coarseness=2, fineness=2):
     Nc = len(coarse_grid)
 
     # Create plasma particles on the coarse grid, the ones that really move
-    coarse_electrons_x_init = np.broadcast_to(coarse_grid_xs, (Nc, Nc))
-    coarse_electrons_y_init = np.broadcast_to(coarse_grid_ys, (Nc, Nc))
-    coarse_electrons_x_offt = np.zeros((Nc, Nc))
-    coarse_electrons_y_offt = np.zeros((Nc, Nc))
-    coarse_electrons_px = np.zeros((Nc, Nc))
-    coarse_electrons_py = np.zeros((Nc, Nc))
-    coarse_electrons_pz = np.zeros((Nc, Nc))
-    coarse_electrons_m = np.ones((Nc, Nc)) * ELECTRON_MASS * coarseness**2
-    coarse_electrons_q = np.ones((Nc, Nc)) * ELECTRON_CHARGE * coarseness**2
+    coarse_electrons_x_init = cp.broadcast_to(cp.asarray(coarse_grid_xs), (Nc, Nc))
+    coarse_electrons_y_init = cp.broadcast_to(cp.asarray(coarse_grid_ys), (Nc, Nc))
+    coarse_electrons_x_offt = cp.zeros((Nc, Nc))
+    coarse_electrons_y_offt = cp.zeros((Nc, Nc))
+    coarse_electrons_px = cp.zeros((Nc, Nc))
+    coarse_electrons_py = cp.zeros((Nc, Nc))
+    coarse_electrons_pz = cp.zeros((Nc, Nc))
+    coarse_electrons_m = cp.ones((Nc, Nc)) * ELECTRON_MASS * coarseness**2
+    coarse_electrons_q = cp.ones((Nc, Nc)) * ELECTRON_CHARGE * coarseness**2
 
     # Calculate indices for coarse -> fine bilinear interpolation
 
@@ -542,7 +504,6 @@ def plasma_make(steps, cell_size, coarseness=2, fineness=2):
             coarse_electrons_m, coarse_electrons_q, virt_params)
 
 
-@numba.jit(inline=True)
 def mix(coarse, A, B, C, D, pi, ni, pj, nj):
     """
     Bilinearly interpolate fine plasma properties from four
@@ -553,43 +514,45 @@ def mix(coarse, A, B, C, D, pi, ni, pj, nj):
      A    C  #         x    D - top-right    neighbour, indices: ni, nj
     See the rest of the deposition and plasma creation for more info.
     """
+    print(type(A), type(coarse), type(pi), type(pj))
     return (A * coarse[pi, pj] + B * coarse[pi, nj] +
             C * coarse[ni, pj] + D * coarse[ni, nj])
 
 
 # Deposition #
 
-# TODO: try to get rid of the CUDA kernel
-@numba.cuda.jit
-def deposit_kernel(grid_steps, grid_step_size, virtplasma_smallness_factor,
-                   c_x_offt, c_y_offt, c_m, c_q, c_px, c_py, c_pz,  # coarse
-                   fine_grid,
-                   influence_prev, influence_next, indices_prev, indices_next,
-                   out_ro, out_jx, out_jy, out_jz):
+def deposit(config, ro_initial, c_x_offt, c_y_offt, c_m, c_q, c_px, c_py, c_pz, virt_params):
     """
     Interpolate coarse plasma into fine plasma and deposit it on the
     charge density and current grids.
+    This is a convenience wrapper around the `deposit_kernel` CUDA kernel.
     """
-    # Do nothing if our thread does not have a fine particle to deposit.
-    fk = numba.cuda.grid(1)
-    if fk >= fine_grid.size**2:
-        return
-    fi, fj = fk // fine_grid.size, fk % fine_grid.size
+    virtplasma_smallness_factor = 1 / (config.plasma_coarseness *
+                                       config.plasma_fineness)**2
+    ro = cp.zeros((config.grid_steps, config.grid_steps))
+    jx = cp.zeros((config.grid_steps, config.grid_steps))
+    jy = cp.zeros((config.grid_steps, config.grid_steps))
+    jz = cp.zeros((config.grid_steps, config.grid_steps))
+
+    Nf = virt_params.fine_grid.size
+    fi = cp.arange(0, Nf)[:, None]
+    fj = cp.arange(0, Nf)[None, :]
 
     # Calculate the weights of the historically-neighbouring coarse particles
-    A = influence_prev[fi] * influence_prev[fj]
-    B = influence_prev[fi] * influence_next[fj]
-    C = influence_next[fi] * influence_prev[fj]
-    D = influence_next[fi] * influence_next[fj]
+    A = virt_params.influence_prev[fi] * virt_params.influence_prev[fj]
+    B = virt_params.influence_prev[fi] * virt_params.influence_next[fj]
+    C = virt_params.influence_next[fi] * virt_params.influence_prev[fj]
+    D = virt_params.influence_next[fi] * virt_params.influence_next[fj]
     # and retrieve their indices.
-    pi, ni = indices_prev[fi], indices_next[fi]
-    pj, nj = indices_prev[fj], indices_next[fj]
+    pi, ni = virt_params.indices_prev[fi], virt_params.indices_next[fi]
+    pj, nj = virt_params.indices_prev[fj], virt_params.indices_next[fj]
 
     # Now we're ready to mix the fine particle characteristics
+    print(type(c_x_offt))
     x_offt = mix(c_x_offt, A, B, C, D, pi, ni, pj, nj)
     y_offt = mix(c_y_offt, A, B, C, D, pi, ni, pj, nj)
-    x = fine_grid[fi] + x_offt  # x_fine_init
-    y = fine_grid[fj] + y_offt  # y_fine_init
+    x = virt_params.fine_grid[fi, None] + x_offt  # x_fine_init
+    y = virt_params.fine_grid[None, fj] + y_offt  # y_fine_init
 
     # TODO: const m and q
     m = virtplasma_smallness_factor * mix(c_m, A, B, C, D, pi, ni, pj, nj)
@@ -607,34 +570,14 @@ def deposit_kernel(grid_steps, grid_step_size, virtplasma_smallness_factor,
     djz = pz * (dro / gamma_m)
 
     i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM = weights(
-        x, y, grid_steps, grid_step_size
+        x, y, config.grid_steps, config.grid_step_size
     )
-    deposit9(out_ro, i, j, dro, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    deposit9(out_jx, i, j, djx, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    deposit9(out_jy, i, j, djy, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    deposit9(out_jz, i, j, djz, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    deposit9(ro, i, j, dro, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    deposit9(jx, i, j, djx, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    deposit9(jy, i, j, djy, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    deposit9(jz, i, j, djz, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
 
 
-def deposit(config, ro_initial, x_offt, y_offt, m, q, px, py, pz, virt_params):
-    """
-    Interpolate coarse plasma into fine plasma and deposit it on the
-    charge density and current grids.
-    This is a convenience wrapper around the `deposit_kernel` CUDA kernel.
-    """
-    virtplasma_smallness_factor = 1 / (config.plasma_coarseness *
-                                       config.plasma_fineness)**2
-    ro = cp.zeros((config.grid_steps, config.grid_steps))
-    jx = cp.zeros((config.grid_steps, config.grid_steps))
-    jy = cp.zeros((config.grid_steps, config.grid_steps))
-    jz = cp.zeros((config.grid_steps, config.grid_steps))
-    cfg = int(np.ceil(virt_params.fine_grid.size**2 / WARP_SIZE)), WARP_SIZE
-    deposit_kernel[cfg](config.grid_steps, config.grid_step_size,
-                        virtplasma_smallness_factor,
-                        x_offt, y_offt, m, q, px, py, pz,
-                        virt_params.fine_grid,
-                        virt_params.influence_prev, virt_params.influence_next,
-                        virt_params.indices_prev, virt_params.indices_next,
-                        ro, jx, jy, jz)
     # Also add the background ion charge density.
     ro += ro_initial  # Do it last to preserve more float precision
     numba.cuda.synchronize()
@@ -647,9 +590,10 @@ def initial_deposition(config, x_offt, y_offt, px, py, pz, m, q, virt_params):
     with their initial parameters and negating the result.
     """
     # Don't allow initial speeds for calculations with background ions
-    assert all([np.array_equiv(p, 0) for p in [px, py, pz]])
+    #assert all([cp.array_equiv(p, 0) for p in [px, py, pz]])
 
-    ro_electrons_initial, _, _, _ = deposit(config, 0, x_offt, y_offt,
+    z = cp.zeros((config.grid_steps, config.grid_steps))
+    ro_electrons_initial, _, _, _ = deposit(config, z, x_offt, y_offt,
                                             m, q, px, py, pz, virt_params)
     return -ro_electrons_initial  # Right on the GPU, huh
 
@@ -673,14 +617,14 @@ def move_smart(config,
     # Calculate midstep positions and fields in them.
     x_halfstep = x_init + (prev_x_offt + estimated_x_offt) / 2
     y_halfstep = y_init + (prev_y_offt + estimated_y_offt) / 2
-    i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM = weights_(
+    i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM = weights(
         x_halfstep, y_halfstep, config.grid_steps, config.grid_step_size
     )
-    Ex = interp9_(Ex_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Ey = interp9_(Ey_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Ez = interp9_(Ez_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Bx = interp9_(Bx_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    By = interp9_(By_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ex = interp9(Ex_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ey = interp9(Ey_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ez = interp9(Ez_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Bx = interp9(Bx_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    By = interp9(By_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
     Bz = 0  # Bz = 0 for now
 
     # Move the particles according the the fields
