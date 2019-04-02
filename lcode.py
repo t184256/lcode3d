@@ -339,8 +339,44 @@ def weights(x, y, grid_steps, grid_step_size):
     return i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM
 
 
+def weights_(x, y, grid_steps, grid_step_size):
+    """
+    Calculate the indices of a cell corresponding to the coordinates,
+    and the coefficients of interpolation and deposition for this cell
+    and 8 surrounding cells.
+    The weights correspond to 2D triangluar shaped cloud (TSC2D).
+    """
+    x_h, y_h = x / grid_step_size + .5, y / grid_step_size + .5
+    i = (cp.floor(x_h) + grid_steps // 2).astype(cp.uint32)
+    j = (cp.floor(y_h) + grid_steps // 2).astype(cp.uint32)
+    x_loc, y_loc = x_h - cp.floor(x_h) - .5, y_h - cp.floor(y_h) - .5
+    # centered to -.5 to 5, not 0 to 1, as formulas use offset from cell center
+    # TODO: get rid of this deoffsetting/reoffsetting festival
+
+    wx0, wy0 = .75 - x_loc**2, .75 - y_loc**2  # fx1, fy1
+    wxP, wyP = (.5 + x_loc)**2 / 2, (.5 + y_loc)**2 / 2  # fx2**2/2, fy2**2/2
+    wxM, wyM = (.5 - x_loc)**2 / 2, (.5 - y_loc)**2 / 2  # fx3**2/2, fy3**2/2
+
+    wMP, w0P, wPP = wxM * wyP, wx0 * wyP, wxP * wyP
+    wM0, w00, wP0 = wxM * wy0, wx0 * wy0, wxP * wy0
+    wMM, w0M, wPM = wxM * wyM, wx0 * wyM, wxP * wyM
+
+    return i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM
+
+
 @numba.jit(inline=True)
 def interp9(a, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM):
+    """
+    Collect value from a cell and 8 surrounding cells (using `weights` output).
+    """
+    return (
+        a[i - 1, j + 1] * wMP + a[i + 0, j + 1] * w0P + a[i + 1, j + 1] * wPP +
+        a[i - 1, j + 0] * wM0 + a[i + 0, j + 0] * w00 + a[i + 1, j + 0] * wP0 +
+        a[i - 1, j - 1] * wMM + a[i + 0, j - 1] * w0M + a[i + 1, j - 1] * wPM
+    )
+
+
+def interp9_(a, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM):
     """
     Collect value from a cell and 8 surrounding cells (using `weights` output).
     """
@@ -620,104 +656,58 @@ def initial_deposition(config, x_offt, y_offt, px, py, pz, m, q, virt_params):
 
 # Field interpolation and particle movement (fused) #
 
-# TODO: try to get rid of the kernel
-@numba.cuda.jit
-def move_smart_kernel(xi_step_size, reflect_boundary,
-                      grid_step_size, grid_steps,
-                      ms, qs,
-                      x_init, y_init,
-                      prev_x_offt, prev_y_offt,
-                      estimated_x_offt, estimated_y_offt,
-                      prev_px, prev_py, prev_pz,
-                      Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
-                      new_x_offt, new_y_offt, new_px, new_py, new_pz):
+def move_smart(config,
+               m, q, x_init, y_init, prev_x_offt, prev_y_offt,
+               estimated_x_offt, estimated_y_offt, prev_px, prev_py, prev_pz,
+               Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg):
     """
     Update plasma particle coordinates and momenta according to the field
     values interpolated halfway between the previous plasma particle location
     and the the best estimation of its next location currently available to us.
-    Also reflect the particles from `+-reflect_boundary`.
     """
-    # Do nothing if our thread does not have a coarse particle to move.
-    k = numba.cuda.grid(1)
-    if k >= ms.size:
-        return
 
-    m, q = ms[k], qs[k]
-
-    opx, opy, opz = prev_px[k], prev_py[k], prev_pz[k]
+    opx, opy, opz = prev_px.copy(), prev_py.copy(), prev_pz.copy()
     px, py, pz = opx, opy, opz
-    x_offt, y_offt = prev_x_offt[k], prev_y_offt[k]
+    x_offt, y_offt = prev_x_offt.copy(), prev_y_offt.copy()
 
     # Calculate midstep positions and fields in them.
-    x_halfstep = x_init[k] + (prev_x_offt[k] + estimated_x_offt[k]) / 2
-    y_halfstep = y_init[k] + (prev_y_offt[k] + estimated_y_offt[k]) / 2
-    i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM = weights(
-        x_halfstep, y_halfstep, grid_steps, grid_step_size
+    x_halfstep = x_init + (prev_x_offt + estimated_x_offt) / 2
+    y_halfstep = y_init + (prev_y_offt + estimated_y_offt) / 2
+    i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM = weights_(
+        x_halfstep, y_halfstep, config.grid_steps, config.grid_step_size
     )
-    Ex = interp9(Ex_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Ey = interp9(Ey_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Ez = interp9(Ez_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Bx = interp9(Bx_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    By = interp9(By_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ex = interp9_(Ex_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ey = interp9_(Ey_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ez = interp9_(Ez_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Bx = interp9_(Bx_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    By = interp9_(By_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
     Bz = 0  # Bz = 0 for now
 
     # Move the particles according the the fields
-    gamma_m = sqrt(m**2 + pz**2 + px**2 + py**2)
+    gamma_m = cp.sqrt(m**2 + pz**2 + px**2 + py**2)
     vx, vy, vz = px / gamma_m, py / gamma_m, pz / gamma_m
-    factor_1 = q * xi_step_size / (1 - pz / gamma_m)
+    factor_1 = q * config.xi_step_size / (1 - pz / gamma_m)
     dpx = factor_1 * (Ex + vy * Bz - vz * By)
     dpy = factor_1 * (Ey - vx * Bz + vz * Bx)
     dpz = factor_1 * (Ez + vx * By - vy * Bx)
     px, py, pz = opx + dpx / 2, opy + dpy / 2, opz + dpz / 2
 
     # Move the particles according the the fields again using updated momenta
-    gamma_m = sqrt(m**2 + pz**2 + px**2 + py**2)
+    gamma_m = cp.sqrt(m**2 + pz**2 + px**2 + py**2)
     vx, vy, vz = px / gamma_m, py / gamma_m, pz / gamma_m
-    factor_1 = q * xi_step_size / (1 - pz / gamma_m)
+    factor_1 = q * config.xi_step_size / (1 - pz / gamma_m)
     dpx = factor_1 * (Ex + vy * Bz - vz * By)
     dpy = factor_1 * (Ey - vx * Bz + vz * Bx)
     dpz = factor_1 * (Ez + vx * By - vy * Bx)
     px, py, pz = opx + dpx / 2, opy + dpy / 2, opz + dpz / 2
 
     # Apply the coordinate and momenta increments
-    gamma_m = sqrt(m**2 + pz**2 + px**2 + py**2)
+    gamma_m = cp.sqrt(m**2 + pz**2 + px**2 + py**2)
 
-    x_offt += px / (gamma_m - pz) * xi_step_size  # no mixing with x_init
-    y_offt += py / (gamma_m - pz) * xi_step_size  # no mixing with y_init
+    x_offt += px / (gamma_m - pz) * config.xi_step_size  # no mixing with x_init
+    y_offt += py / (gamma_m - pz) * config.xi_step_size  # no mixing with y_init
 
     px, py, pz = opx + dpx, opy + dpy, opz + dpz
-
-    # Save the results into the output arrays  # TODO: get rid of that
-    new_x_offt[k], new_y_offt[k] = x_offt, y_offt
-    new_px[k], new_py[k], new_pz[k] = px, py, pz
-
-
-def move_smart(config,
-               m, q, x_init, y_init, x_prev_offt, y_prev_offt,
-               estimated_x_offt, estimated_y_offt, px_prev, py_prev, pz_prev,
-               Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg):
-    """
-    Update plasma particle coordinates and momenta according to the field
-    values interpolated halfway between the previous plasma particle location
-    and the the best estimation of its next location currently available to us.
-    This is a convenience wrapper around the `move_smart_kernel` CUDA kernel.
-    """
-    x_offt = cp.zeros_like(x_prev_offt)
-    y_offt = cp.zeros_like(y_prev_offt)
-    px = cp.zeros_like(px_prev)
-    py = cp.zeros_like(py_prev)
-    pz = cp.zeros_like(pz_prev)
-    cfg = int(np.ceil(x_init.size / WARP_SIZE)), WARP_SIZE
-    move_smart_kernel[cfg](config.xi_step_size, config.reflect_boundary,
-                           config.grid_step_size, config.grid_steps,
-                           m.ravel(), q.ravel(),
-                           x_init.ravel(), y_init.ravel(),
-                           x_prev_offt.ravel(), y_prev_offt.ravel(),
-                           estimated_x_offt.ravel(), estimated_y_offt.ravel(),
-                           px_prev.ravel(), py_prev.ravel(), pz_prev.ravel(),
-                           Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
-                           x_offt.ravel(), y_offt.ravel(),
-                           px.ravel(), py.ravel(), pz.ravel())
 
     reflect_boundary = config.reflect_boundary
     x, y = x_init + x_offt, y_init + y_offt
