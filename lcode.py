@@ -136,96 +136,6 @@ def dst2d(a):
     return -cp.fft.rfft2(p)[1:N+1, 1:N+1].real
 
 
-@cp.memoize()
-def dirichlet_matrix(grid_steps, grid_step_size):
-    """
-    Calculate a magical matrix that solves the Laplace equation
-    if you elementwise-multiply the RHS by it "in DST-space".
-    See Samarskiy-Nikolaev, p. 187.
-    """
-    # mul[i, j] = 1 / (lam[i] + lam[j])
-    # lam[k] = 4 / h**2 * sin(k * pi * h / (2 * L))**2, where L = h * (N - 1)
-    k = cp.arange(1, grid_steps - 1)
-    lam = 4 / grid_step_size**2 * cp.sin(k * cp.pi / (2 * (grid_steps - 1)))**2
-    lambda_i, lambda_j = lam[:, None], lam[None, :]
-    mul = 1 / (lambda_i + lambda_j)
-    return mul / (2 * (grid_steps - 1))**2  # additional 2xDST normalization
-
-
-def calculate_Ez(config, jx, jy):
-    """
-    Calculate Ez as iDST2D(dirichlet_matrix * DST2D(djx/dx + djy/dy)).
-    """
-    # 0. Calculate RHS (NOTE: it is smaller by 1 on each side).
-    # NOTE: use gradient instead if available (cupy doesn't have gradient yet).
-    djx_dx = jx[2:, 1:-1] - jx[:-2, 1:-1]
-    djy_dy = jy[1:-1, 2:] - jy[1:-1, :-2]
-    rhs_inner = -(djx_dx + djy_dy) / (config.grid_step_size * 2)  # -?
-
-    # 1. Apply DST-Type1-2D (Discrete Sine Transform Type 1 2D) to the RHS.
-    f = dst2d(rhs_inner)
-
-    # 2. Multiply f by the special matrix that does the job and normalizes.
-    f *= dirichlet_matrix(config.grid_steps, config.grid_step_size)
-
-    # 3. Apply iDST-Type1-2D (Inverse Discrete Sine Transform Type 1 2D).
-    #    We don't have to define a separate iDST function, because
-    #    unnormalized DST-Type1 is its own inverse, up to a factor 2(N+1)
-    #    and we take all scaling matters into account with a single factor
-    #    hidden inside dirichlet_matrix.
-    Ez_inner = dst2d(f)
-    Ez = cp.pad(Ez_inner, 1, 'constant', constant_values=0)
-    numba.cuda.synchronize()
-    return Ez
-
-
-# Solving Laplace or Helmholtz equation with mixed boundary conditions #
-
-# jury-rigged from padded rFFT
-def mix2d(a):
-    """
-    Calculate a DST-DCT-hybrid transform
-    (DST in first direction, DCT in second one),
-    jury-rigged from padded rFFT
-    (anti-symmetrically in first direction, symmetrically in second direction).
-    """
-    # NOTE: LCODE 3D uses x as the first direction, thus the confision below.
-    M, N = a.shape
-    #                                  /(0  1  2  0)-2 -1 \      +---->  x
-    #  / 1  2 \                       | (0  3  4  0)-4 -3  |     |      (M)
-    #  | 3  4 |  mixed-symmetrically  | (0  5  6  0)-6 -5  |     |
-    #  | 5  6 |       padded to       | (0  7  8  0)-8 -7  |     v
-    #  \ 7  8 /                       |  0 +5 +6  0 -6 -5  |
-    #                                  \ 0 +3 +4  0 -4 -3 /      y (N)
-    p = cp.zeros((2 * M + 2, 2 * N - 2))  # wider than before
-    p[1:M+1, :N] = a
-    p[M+2:2*M+2, :N] = -cp.flipud(a)  # flip to right on drawing above
-    p[1:M+1, N-1:2*N-2] = cp.fliplr(a)[:, :-1]  # flip down on drawing above
-    p[M+2:2*M+2, N-1:2*N-2] = -cp.flipud(cp.fliplr(a))[:, :-1]
-    # Note: the returned array is wider than the input array, it is padded
-    # with zeroes (depicted above as a square region marked with round braces).
-    return -cp.fft.rfft2(p)[:M+2, :N].imag  # FFT, cut a corner with 0s, -imag
-
-
-@cp.memoize()
-def mixed_matrix(grid_steps, grid_step_size, subtraction_trick):
-    """
-    Calculate a magical matrix that solves the Laplace or Helmholtz equation
-    (subtraction_trick=True and subtraction_trick=False correspondingly)
-    if you elementwise-multiply the RHS by it "in DST-DCT-transformed-space".
-    See Samarskiy-Nikolaev, p. 189 and around.
-    """
-    # mul[i, j] = 1 / (lam[i] + lam[j])
-    # lam[k] = 4 / h**2 * sin(k * pi * h / (2 * L))**2, where L = h * (N - 1)
-    # but k for lam_i spans from 1..N-2, while k for lam_j covers 0..N-1
-    ki, kj = cp.arange(1, grid_steps - 1), cp.arange(grid_steps)
-    li = 4 / grid_step_size**2 * cp.sin(ki * cp.pi / (2 * (grid_steps - 1)))**2
-    lj = 4 / grid_step_size**2 * cp.sin(kj * cp.pi / (2 * (grid_steps - 1)))**2
-    lambda_i, lambda_j = li[:, None], lj[None, :]
-    mul = 1 / (lambda_i + lambda_j + (1 if subtraction_trick else 0))
-    return mul / (2 * (grid_steps - 1))**2  # additional 2xDST normalization
-
-
 def dx_dy(arr, grid_step_size):
     """
     Calculate x and y derivatives simultaneously (like np.gradient does).
@@ -238,54 +148,94 @@ def dx_dy(arr, grid_step_size):
     return dx / (grid_step_size * 2), dy / (grid_step_size * 2)
 
 
-def calculate_Ex_Ey_Bx_By(config, Ex_avg, Ey_avg, Bx_avg, By_avg,
-                          beam_ro, ro, jx, jy, jz, jx_prev, jy_prev):
+@cp.memoize()
+def dirichlet_matrix(grid_steps, grid_step_size, subtraction_trick):
     """
-    Calculate transverse fields as iDST-DCT(mixed_matrix * DST-DCT(RHS.T)).T,
-    with and without transposition depending on the field component.
-    NOTE: density and currents are assumed to be zero on the perimeter
-          (no plasma particles must reach the wall, so the reflection boundary
-           must be closer to the center than the simulation window boundary
-           minus the coarse plasma particle cloud width).
+    Calculate a magical matrix that solves the Laplace or Helmholtz equation
+    (subtraction_trick=True and subtraction_trick=False correspondingly)
+    if you elementwise-multiply the RHS by it "in DST-space".
+    See Samarskiy-Nikolaev, p. 187.
     """
-    # 0. Calculate gradients and RHS.
-    dro_dx, dro_dy = dx_dy(ro + beam_ro, config.grid_step_size)
-    djz_dx, djz_dy = dx_dy(jz + beam_ro, config.grid_step_size)
-    djx_dxi = (jx_prev - jx) / config.xi_step_size  # - ?
-    djy_dxi = (jy_prev - jy) / config.xi_step_size  # - ?
+    # mul[i, j] = 1 / (lam[i] + lam[j])
+    # lam[k] = 4 / h**2 * sin(k * pi * h / (2 * L))**2, where L = h * (N - 1)
+    k = cp.arange(1, grid_steps - 1)
+    lam = 4 / grid_step_size**2 * cp.sin(k * cp.pi / (2 * (grid_steps - 1)))**2
+    lambda_i, lambda_j = lam[:, None], lam[None, :]
+    mul = 1 / (lambda_i + lambda_j + subtraction_trick)
+    return mul / (2 * (grid_steps - 1))**2  # additional 2xDST normalization
 
-    # Are we solving a Laplace equation or a Helmholtz one?
-    subtraction_trick = config.field_solver_subtraction_trick
-    Ex_rhs = -((dro_dx - djx_dxi) - Ex_avg * subtraction_trick)  # -?
-    Ey_rhs = -((dro_dy - djy_dxi) - Ey_avg * subtraction_trick)
-    Bx_rhs = +((djz_dy - djy_dxi) + Bx_avg * subtraction_trick)
-    By_rhs = -((djz_dx - djx_dxi) - By_avg * subtraction_trick)
 
-    # Boundary conditions application (for future reference, ours are zero):
-    # rhs[:, 0] -= bound_bottom[:] * (2 / grid_step_size)
-    # rhs[:, -1] += bound_top[:] * (2 / grid_step_size)
+def calculate_helmholtz(config, rhs, subtraction_trick=True):
+    """
+    Calculate Ez as iDST2D(dirichlet_matrix * DST2D(djx/dx + djy/dy)).
+    """
+    # NOTE: RHS must be smaller by 1 on each side.
 
-    # 1. Apply our mixed DCT-DST transform to RHS.
-    Ey_f = mix2d(Ey_rhs[1:-1, :])[1:-1, :]
+    # 1. Apply DST-Type1-2D (Discrete Sine Transform Type 1 2D) to the RHS.
+    f = dst2d(-rhs)
 
-    # 2. Multiply f by the magic matrix.
-    mix_mat = mixed_matrix(config.grid_steps, config.grid_step_size,
-                           config.field_solver_subtraction_trick)
-    Ey_f *= mix_mat
+    # 2. Multiply f by the special matrix that does the job and normalizes.
+    f *= dirichlet_matrix(config.grid_steps, config.grid_step_size,
+                          subtraction_trick)
 
-    # 3. Apply our mixed DCT-DST transform again.
-    Ey = mix2d(Ey_f)
+    # 3. Apply iDST-Type1-2D (Inverse Discrete Sine Transform Type 1 2D).
+    #    We don't have to define a separate iDST function, because
+    #    unnormalized DST-Type1 is its own inverse, up to a factor 2(N+1)
+    #    and we take all scaling matters into account with a single factor
+    #    hidden inside dirichlet_matrix.
+    r_inner = dst2d(f)
+    r = cp.pad(r_inner, 1, 'constant', constant_values=0)
+    numba.cuda.synchronize()
+    return r
 
-    # Likewise for other fields:
-    Bx = mix2d(mix_mat * mix2d(Bx_rhs[1:-1, :])[1:-1, :])
-    By = mix2d(mix_mat * mix2d(By_rhs.T[1:-1, :])[1:-1, :]).T
-    Ex = mix2d(mix_mat * mix2d(Ex_rhs.T[1:-1, :])[1:-1, :]).T
 
-    return Ex, Ey, Bx, By
+def calculate_potentials(config, beam_ro, ro, jx, jy, jz, phi_sub,
+                         Ax_sub, Ay_sub, Az_sub, subtraction_trick=True):
+    # Calculate RHS (NOTE: it must become smaller by 1 on each side).
+    phi_rhs = -ro - beam_ro - phi_sub * subtraction_trick
+    Ax_rhs = -jx - Ax_sub * subtraction_trick
+    Ay_rhs = -jy - Ay_sub * subtraction_trick
+    Az_rhs = -jz - beam_ro - Az_sub * subtraction_trick
+
+    phi = calculate_helmholtz(config, rhs=phi_rhs[1:-1, 1:-1])
+    Ax = calculate_helmholtz(config, rhs=Ax_rhs[1:-1, 1:-1])
+    Ay = calculate_helmholtz(config, rhs=Ay_rhs[1:-1, 1:-1])
+    Az = calculate_helmholtz(config, rhs=Az_rhs[1:-1, 1:-1])
+    return phi, Ax, Ay, Az
+
+
+def calculate_fields(config, phi, Ax, Ay, Az,
+                     prev_phi, prev_Ax, prev_Ay, prev_Az):
+    phi_avg = (phi + prev_phi) / 2
+    Ax_avg = (Ax + prev_Ax) / 2
+    Ay_avg = (Ay + prev_Ay) / 2
+    Az_avg = (Az + prev_Az) / 2
+
+    dphi_avg_dx, dphi_avg_dy = dx_dy(phi_avg, config.grid_step_size)
+    dAx_avg_dx, dAx_avg_dy = dx_dy(Ax_avg, config.grid_step_size)
+    dAy_avg_dx, dAy_avg_dy = dx_dy(Ay_avg, config.grid_step_size)
+    dAz_avg_dx, dAz_avg_dy = dx_dy(Az_avg, config.grid_step_size)
+
+    # it's prev - curr, as dxi = -xi_step_size < 0
+    dAx_dxi = (prev_Ax - Ax) / config.xi_step_size
+    dAy_dxi = (prev_Ay - Ay) / config.xi_step_size
+    # dAz_dxi = (prev_Az - Az) / config.xi_step_size
+
+    Phi = phi - Az
+    prev_Phi = prev_phi - prev_Az
+    dPhi_dxi = (prev_Phi - Phi) / config.xi_step_size
+
+    Ex = - dphi_avg_dx + dAx_dxi
+    Ey = - dphi_avg_dy + dAy_dxi
+    Ez = - dPhi_dxi
+    Bx = + dAz_avg_dy - dAy_dxi
+    By = + dAx_dxi - dAz_avg_dx
+    Bz = + dAy_avg_dx - dAx_avg_dy
+
+    return Ex, Ey, Ez, Bx, By, Bz
 
 
 # Pushing particles without any fields (used for initial halfstep estimation) #
-
 
 def move_estimate_wo_fields(config,
                             m, x_init, y_init, prev_x_offt, prev_y_offt,
@@ -640,7 +590,7 @@ def move_smart_kernel(xi_step_size, reflect_boundary,
                       prev_x_offt, prev_y_offt,
                       estimated_x_offt, estimated_y_offt,
                       prev_px, prev_py, prev_pz,
-                      Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
+                      Exs, Eys, Ezs, Bxs, Bys, Bzs,
                       new_x_offt, new_y_offt, new_px, new_py, new_pz):
     """
     Update plasma particle coordinates and momenta according to the field
@@ -665,12 +615,12 @@ def move_smart_kernel(xi_step_size, reflect_boundary,
     i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM = weights(
         x_halfstep, y_halfstep, grid_steps, grid_step_size
     )
-    Ex = interp9(Ex_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Ey = interp9(Ey_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Ez = interp9(Ez_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Bx = interp9(Bx_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    By = interp9(By_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Bz = 0  # Bz = 0 for now
+    Ex = interp9(Exs, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ey = interp9(Eys, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ez = interp9(Ezs, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Bx = interp9(Bxs, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    By = interp9(Bys, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Bz = interp9(Bzs, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
 
     # Move the particles according the the fields
     gamma_m = sqrt(m**2 + pz**2 + px**2 + py**2)
@@ -727,7 +677,7 @@ def move_smart_kernel(xi_step_size, reflect_boundary,
 def move_smart(config,
                m, q, x_init, y_init, x_prev_offt, y_prev_offt,
                estimated_x_offt, estimated_y_offt, px_prev, py_prev, pz_prev,
-               Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg):
+               Ex, Ey, Ez, Bx, By, Bz):
     """
     Update plasma particle coordinates and momenta according to the field
     values interpolated halfway between the previous plasma particle location
@@ -747,7 +697,7 @@ def move_smart(config,
                            x_prev_offt.ravel(), y_prev_offt.ravel(),
                            estimated_x_offt.ravel(), estimated_y_offt.ravel(),
                            px_prev.ravel(), py_prev.ravel(), pz_prev.ravel(),
-                           Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
+                           Ex, Ey, Ez, Bx, By, Bz,
                            x_offt_new.ravel(), y_offt_new.ravel(),
                            px_new.ravel(), py_new.ravel(), pz_new.ravel())
     numba.cuda.synchronize()
@@ -765,8 +715,6 @@ def step(config, const, virt_params, prev, beam_ro):
     """
     beam_ro = cp.asarray(beam_ro)  # copy the array is on GPU if it's not there
 
-    Bz = cp.zeros_like(prev.Bz)  # Bz = 0 for now
-
     # Estimate the midpoint particle position without knowing the fields yet
     # TODO: use regular pusher and pass zero fields? previous fields?
     x_offt, y_offt = move_estimate_wo_fields(config, const.m,
@@ -774,83 +722,89 @@ def step(config, const, virt_params, prev, beam_ro):
                                              prev.x_offt, prev.y_offt,
                                              prev.px, prev.py, prev.pz)
 
-    # Interpolate fields in midpoint and move particles with previous fields.
+    # Move particles with est. positions and previous fields (!).
     x_offt, y_offt, px, py, pz = move_smart(
         config, const.m, const.q, const.x_init, const.y_init,
         prev.x_offt, prev.y_offt, x_offt, y_offt, prev.px, prev.py, prev.pz,
-        # no halfstep-averaged fields yet
-        prev.Ex, prev.Ey, prev.Ez, prev.Bx, prev.By, Bz_avg=0
+        # no +1/2 step fields yet, using -1/2 step ones instead for now
+        prev.Ex, prev.Ey, prev.Ez, prev.Bx, prev.By, prev.Bz
     )
-    # Recalculate the plasma density and currents.
+    # Recalculate the plasma density and currents (old fields, bad pos!)
     ro, jx, jy, jz = deposit(
         config, const.ro_initial, x_offt, y_offt, const.m, const.q, px, py, pz,
         virt_params
     )
 
-    # Calculate the fields.
-    ro_in = ro if not config.field_solver_variant_A else (ro + prev.ro) / 2
-    jz_in = jz if not config.field_solver_variant_A else (jz + prev.jz) / 2
-    Ex, Ey, Bx, By = calculate_Ex_Ey_Bx_By(config,
-                                           prev.Ex, prev.Ey, prev.Bx, prev.By,
-                                           # no halfstep-averaged fields yet
-                                           beam_ro, ro_in, jx, jy, jz_in,
-                                           prev.jx, prev.jy)
-    if config.field_solver_variant_A:
-        Ex, Ey = 2 * Ex - prev.Ex, 2 * Ey - prev.Ey
-        Bx, By = 2 * Bx - prev.Bx, 2 * By - prev.By
+    # Calculate the fields (density and current used old fields, bad pos!)
+    phi, Ax, Ay, Az = calculate_potentials(config, beam_ro, ro, jx, jy, jz,
+                                           prev.phi, prev.Ax, prev.Ay, prev.Az,
+                                           config.field_solver_subtraction_trick)
+    Ex, Ey, Ez, Bx, By, Bz = calculate_fields(config, phi, Ax, Ay, Az,
+                                              prev.phi, prev.Ax,
+                                              prev.Ay, prev.Az)
 
-    Ez = calculate_Ez(config, jx, jy)
-    # Bz = 0 for now
-    Ex_avg = (Ex + prev.Ex) / 2
-    Ey_avg = (Ey + prev.Ey) / 2
-    Ez_avg = (Ez + prev.Ez) / 2
-    Bx_avg = (Bx + prev.Bx) / 2
-    By_avg = (By + prev.By) / 2
+    # Now that's something. Let's reiterate, but with better fields this time:
 
-    # Repeat the previous procedure using averaged fields.
+    x_offt, y_offt, px, py, pz = move_smart(
+        config, const.m, const.q, const.x_init, const.y_init,
+        prev.x_offt, prev.y_offt, x_offt, y_offt, prev.px, prev.py, prev.pz,
+        Ex, Ey, Ez, Bx, By, Bz  # that's better
+    )
+    ro, jx, jy, jz = deposit(config, const.ro_initial, x_offt, y_offt,
+                             const.m, const.q, px, py, pz, virt_params)
+    phi, Ax, Ay, Az = calculate_potentials(config, beam_ro, ro, jx, jy, jz,
+                                           phi, Ax, Ay, Az,
+                                           config.field_solver_subtraction_trick)
+    Ex, Ey, Ez, Bx, By, Bz = calculate_fields(config, phi, Ax, Ay, Az,
+                                              prev.phi, prev.Ax,
+                                              prev.Ay, prev.Az)
+
+    # ...
+
+    x_offt, y_offt, px, py, pz = move_smart(
+        config, const.m, const.q, const.x_init, const.y_init,
+        prev.x_offt, prev.y_offt, x_offt, y_offt, prev.px, prev.py, prev.pz,
+        Ex, Ey, Ez, Bx, By, Bz  # that's better
+    )
+    ro, jx, jy, jz = deposit(config, const.ro_initial, x_offt, y_offt,
+                             const.m, const.q, px, py, pz, virt_params)
+    phi, Ax, Ay, Az = calculate_potentials(config, beam_ro, ro, jx, jy, jz,
+                                           phi, Ax, Ay, Az,
+                                           config.field_solver_subtraction_trick)
+    Ex, Ey, Ez, Bx, By, Bz = calculate_fields(config, phi, Ax, Ay, Az,
+                                              prev.phi, prev.Ax,
+                                              prev.Ay, prev.Az)
+
+    # ...
+
+    x_offt, y_offt, px, py, pz = move_smart(
+        config, const.m, const.q, const.x_init, const.y_init,
+        prev.x_offt, prev.y_offt, x_offt, y_offt, prev.px, prev.py, prev.pz,
+        Ex, Ey, Ez, Bx, By, Bz  # that's better
+    )
+    ro, jx, jy, jz = deposit(config, const.ro_initial, x_offt, y_offt,
+                             const.m, const.q, px, py, pz, virt_params)
+    phi, Ax, Ay, Az = calculate_potentials(config, beam_ro, ro, jx, jy, jz,
+                                           phi, Ax, Ay, Az,
+                                           config.field_solver_subtraction_trick)
+    Ex, Ey, Ez, Bx, By, Bz = calculate_fields(config, phi, Ax, Ay, Az,
+                                              prev.phi, prev.Ax,
+                                              prev.Ay, prev.Az)
+
+    # And once again:
     x_offt, y_offt, px, py, pz = move_smart(
         config, const.m, const.q, const.x_init, const.y_init,
         prev.x_offt, prev.y_offt, x_offt, y_offt,
         prev.px, prev.py, prev.pz,
-        Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg=0
+        Ex, Ey, Ez, Bx, By, Bz
     )
     ro, jx, jy, jz = deposit(config, const.ro_initial, x_offt, y_offt,
                              const.m, const.q, px, py, pz, virt_params)
-
-    ro_in = ro if not config.field_solver_variant_A else (ro + prev.ro) / 2
-    jz_in = jz if not config.field_solver_variant_A else (jz + prev.jz) / 2
-    Ex, Ey, Bx, By = calculate_Ex_Ey_Bx_By(config,
-                                           Ex_avg, Ey_avg, Bx_avg, By_avg,
-                                           beam_ro, ro_in, jx, jy, jz_in,
-                                           prev.jx, prev.jy)
-    if config.field_solver_variant_A:
-        Ex, Ey = 2 * Ex - prev.Ex, 2 * Ey - prev.Ey
-        Bx, By = 2 * Bx - prev.Bx, 2 * By - prev.By
-
-    Ez = calculate_Ez(config, jx, jy)
-    # Bz = 0 for now
-    Ex_avg = (Ex + prev.Ex) / 2
-    Ey_avg = (Ey + prev.Ey) / 2
-    Ez_avg = (Ez + prev.Ez) / 2
-    Bx_avg = (Bx + prev.Bx) / 2
-    By_avg = (By + prev.By) / 2
-
-    # Repeat the previous procedure using averaged fields once again.
-    x_offt, y_offt, px, py, pz = move_smart(
-        config, const.m, const.q, const.x_init, const.y_init,
-        prev.x_offt, prev.y_offt, x_offt, y_offt,
-        prev.px, prev.py, prev.pz,
-        Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg=0
-    )
-    ro, jx, jy, jz = deposit(config, const.ro_initial, x_offt, y_offt,
-                             const.m, const.q, px, py, pz, virt_params)
-
-    # TODO: what do we need that roj_new for, jx_prev/jy_prev only?
 
     # Return the array collection that would serve as `prev` for the next step.
     new_state = GPUArrays(x_offt=x_offt, y_offt=y_offt, px=px, py=py, pz=pz,
-                          Ex=Ex.copy(), Ey=Ey.copy(), Ez=Ez.copy(),
-                          Bx=Bx.copy(), By=By.copy(), Bz=Bz.copy(),
+                          phi=phi, Ax=Ax, Ay=Ay, Az=Az,
+                          Ex=Ex, Ey=Ey, Ez=Ez, Bx=Bx, By=By, Bz=Bz,
                           ro=ro, jx=jx, jy=jy, jz=jz)
 
     return new_state
@@ -893,6 +847,7 @@ def init(config):
         return cp.zeros((config.grid_steps, config.grid_steps))
 
     state = GPUArrays(x_offt=x_offt, y_offt=y_offt, px=px, py=py, pz=pz,
+                      phi=zeros(), Ax=zeros(), Ay=zeros(), Az=zeros(),
                       Ex=zeros(), Ey=zeros(), Ez=zeros(),
                       Bx=zeros(), By=zeros(), Bz=zeros(),
                       ro=zeros(), jx=zeros(), jy=zeros(), jz=zeros())
