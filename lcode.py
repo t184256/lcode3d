@@ -632,6 +632,36 @@ def initial_deposition(config, x_offt, y_offt, px, py, pz, m, q, virt_params):
 
 # Field interpolation and particle movement (fused) #
 
+@numba.jit(inline=True)
+def solve_3x3(m, v):
+    """
+    Calculate x in m @ x = v as x = m^-1 @ v.
+    """
+    # Compute the determinant
+    det = (+ m[0, 0] * (m[1, 1] * m[2, 2] - m[2, 1] * m[1, 2])
+           - m[0, 1] * (m[1, 0] * m[2, 2] - m[1, 2] * m[2, 0])
+           + m[0, 2] * (m[1, 0] * m[2, 1] - m[1, 1] * m[2, 0]))
+    invdet = 1 / det
+
+    # Invert (fixed-size 3x3)
+    minv00 = (m[1, 1] * m[2, 2] - m[2, 1] * m[1, 2]) * invdet
+    minv01 = (m[0, 2] * m[2, 1] - m[0, 1] * m[2, 2]) * invdet
+    minv02 = (m[0, 1] * m[1, 2] - m[0, 2] * m[1, 1]) * invdet
+    minv10 = (m[1, 2] * m[2, 0] - m[1, 0] * m[2, 2]) * invdet
+    minv11 = (m[0, 0] * m[2, 2] - m[0, 2] * m[2, 0]) * invdet
+    minv12 = (m[1, 0] * m[0, 2] - m[0, 0] * m[1, 2]) * invdet
+    minv20 = (m[1, 0] * m[2, 1] - m[2, 0] * m[1, 1]) * invdet
+    minv21 = (m[2, 0] * m[0, 1] - m[0, 0] * m[2, 1]) * invdet
+    minv22 = (m[0, 0] * m[1, 1] - m[1, 0] * m[0, 1]) * invdet
+
+    # Multiply minv by v
+    x0 = v[0] * minv00 + v[1] * minv01 + v[2] * minv02
+    x1 = v[0] * minv10 + v[1] * minv11 + v[2] * minv12
+    x2 = v[0] * minv20 + v[1] * minv21 + v[2] * minv22
+
+    return x0, x1, x2
+
+
 @numba.cuda.jit
 def move_smart_kernel(xi_step_size, reflect_boundary,
                       grid_step_size, grid_steps,
@@ -640,12 +670,11 @@ def move_smart_kernel(xi_step_size, reflect_boundary,
                       prev_x_offt, prev_y_offt,
                       estimated_x_offt, estimated_y_offt,
                       prev_px, prev_py, prev_pz,
-                      Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
+                      Exs, Eys, Ezs, Bxs, Bys, Bzs,
+                      prev_Ex, prev_Ey, prev_Ez, prev_Bx, prev_By, prev_Bz,
                       new_x_offt, new_y_offt, new_px, new_py, new_pz):
     """
-    Update plasma particle coordinates and momenta according to the field
-    values interpolated halfway between the previous plasma particle location
-    and the the best estimation of its next location currently available to us.
+    Update plasma particle coordinates and momenta ...
     Also reflect the particles from `+-reflect_boundary`.
     """
     # Do nothing if our thread does not have a coarse particle to move.
@@ -653,50 +682,61 @@ def move_smart_kernel(xi_step_size, reflect_boundary,
     if k >= ms.size:
         return
 
+    mat = numba.cuda.local.array((3, 3), numba.float64)
+    vec = numba.cuda.local.array(3, numba.float64)
+
     m, q = ms[k], qs[k]
 
     opx, opy, opz = prev_px[k], prev_py[k], prev_pz[k]
     px, py, pz = opx, opy, opz
     x_offt, y_offt = prev_x_offt[k], prev_y_offt[k]
 
-    # Calculate midstep positions and fields in them.
-    x_halfstep = x_init[k] + (prev_x_offt[k] + estimated_x_offt[k]) / 2
-    y_halfstep = y_init[k] + (prev_y_offt[k] + estimated_y_offt[k]) / 2
+    # Take previous fields in previous positions
+    prev_x = x_init[k] + prev_x_offt[k]
+    prev_y = y_init[k] + prev_y_offt[k]
     i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM = weights(
-        x_halfstep, y_halfstep, grid_steps, grid_step_size
+        prev_x, prev_y, grid_steps, grid_step_size
     )
-    Ex = interp9(Ex_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Ey = interp9(Ey_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Ez = interp9(Ez_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    Bx = interp9(Bx_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
-    By = interp9(By_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ex = interp9(prev_Ex, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ey = interp9(prev_Ey, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ez = interp9(prev_Ez, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Bx = interp9(prev_Bx, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    By = interp9(prev_By, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
     Bz = 0  # Bz = 0 for now
 
-    # Move the particles according the the fields
+    # Estimate px, py, pz at half-step using old gamma and tau
     gamma_m = sqrt(m**2 + pz**2 + px**2 + py**2)
-    vx, vy, vz = px / gamma_m, py / gamma_m, pz / gamma_m
-    factor_1 = q * xi_step_size / (1 - pz / gamma_m)
-    dpx = factor_1 * (Ex + vy * Bz - vz * By)
-    dpy = factor_1 * (Ey - vx * Bz + vz * Bx)
-    dpz = factor_1 * (Ez + vx * By - vy * Bx)
-    px, py, pz = opx + dpx / 2, opy + dpy / 2, opz + dpz / 2
+    tau = q * (-xi_step_size) / (1 - pz / gamma_m)
+    t = tau / (2 * gamma_m)
+    u = tau / 2
+    # /   1   +t*Bz -t*By \   / px \   / opx - Ex*u \
+    # | -t*Bz   1   +t*Bx | @ | py | = | opy - Ey*u |
+    # \ +t*By -t*Bx   1   /   \ pz /   \ opz - Ez*u /
+    mat[0, 0], mat[0, 1], mat[0, 2] = (((1))), +t * Bz, -t * By
+    mat[1, 0], mat[1, 1], mat[1, 2] = -t * Bz, (((1))), +t * Bx
+    mat[2, 0], mat[2, 1], mat[2, 2] = +t * By, -t * Bx, (((1)))
+    vec[0], vec[1], vec[2] = opx - Ex * u, opy - Ey * u, opz - Ez * u
+    px, py, pz = solve_3x3(mat, vec)
 
-    # Move the particles according the the fields again using updated momenta
+    # Calculate px, py, pz at half-step using gamma and tau at halfstep
     gamma_m = sqrt(m**2 + pz**2 + px**2 + py**2)
-    vx, vy, vz = px / gamma_m, py / gamma_m, pz / gamma_m
-    factor_1 = q * xi_step_size / (1 - pz / gamma_m)
-    dpx = factor_1 * (Ex + vy * Bz - vz * By)
-    dpy = factor_1 * (Ey - vx * Bz + vz * Bx)
-    dpz = factor_1 * (Ez + vx * By - vy * Bx)
-    px, py, pz = opx + dpx / 2, opy + dpy / 2, opz + dpz / 2
+    tau = q * (-xi_step_size) / (1 - pz / gamma_m)
+    t = tau / (2 * gamma_m)
+    u = tau / 2
+    # /   1   +t*Bz -t*By \   / px \   / opx - Ex*u \
+    # | -t*Bz   1   +t*Bx | @ | py | = | opy - Ey*u |
+    # \ +t*By -t*Bx   1   /   \ pz /   \ opz - Ez*u /
+    mat[0, 0], mat[0, 1], mat[0, 2] = (((1))), +t * Bz, -t * By
+    mat[1, 0], mat[1, 1], mat[1, 2] = -t * Bz, (((1))), +t * Bx
+    mat[2, 0], mat[2, 1], mat[2, 2] = +t * By, -t * Bx, (((1)))
+    vec[0], vec[1], vec[2] = opx - Ex * u, opy - Ey * u, opz - Ez * u
+    px, py, pz = solve_3x3(mat, vec)
 
     # Apply the coordinate and momenta increments
     gamma_m = sqrt(m**2 + pz**2 + px**2 + py**2)
 
     x_offt += px / (gamma_m - pz) * xi_step_size  # no mixing with x_init
     y_offt += py / (gamma_m - pz) * xi_step_size  # no mixing with y_init
-
-    px, py, pz = opx + dpx, opy + dpy, opz + dpz
 
     # Reflect the particles from `+-reflect_boundary`.
     # TODO: avoid branching?
@@ -719,6 +759,26 @@ def move_smart_kernel(xi_step_size, reflect_boundary,
         y_offt = y - y_init[k]
         py = -py
 
+    x_field = x
+    y_field = y
+    # Now recalculate everything at +1 and advance momenta one more halfstep.
+    i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM = weights(
+        x_field, y_field, grid_steps, grid_step_size
+    )
+    Ex = interp9(Exs, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ey = interp9(Eys, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Ez = interp9(Ezs, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Bx = interp9(Bxs, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    By = interp9(Bys, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+    Bz = 0
+
+    vx, vy, vz = px / gamma_m, py / gamma_m, pz / gamma_m
+    factor_1 = q * xi_step_size / (1 - pz / gamma_m)
+    dpx = factor_1 * (Ex + vy * Bz - vz * By)
+    dpy = factor_1 * (Ey - vx * Bz + vz * Bx)
+    dpz = factor_1 * (Ez + vx * By - vy * Bx)
+    px, py, pz = px + dpx / 2, py + dpy / 2, pz + dpz / 2
+
     # Save the results into the output arrays  # TODO: get rid of that
     new_x_offt[k], new_y_offt[k] = x_offt, y_offt
     new_px[k], new_py[k], new_pz[k] = px, py, pz
@@ -727,7 +787,8 @@ def move_smart_kernel(xi_step_size, reflect_boundary,
 def move_smart(config,
                m, q, x_init, y_init, x_prev_offt, y_prev_offt,
                estimated_x_offt, estimated_y_offt, px_prev, py_prev, pz_prev,
-               Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg):
+               Ex, Ey, Ez, Bx, By, Bz,
+               prev_Ex, prev_Ey, prev_Ez, prev_Bx, prev_By, prev_Bz):
     """
     Update plasma particle coordinates and momenta according to the field
     values interpolated halfway between the previous plasma particle location
@@ -747,7 +808,8 @@ def move_smart(config,
                            x_prev_offt.ravel(), y_prev_offt.ravel(),
                            estimated_x_offt.ravel(), estimated_y_offt.ravel(),
                            px_prev.ravel(), py_prev.ravel(), pz_prev.ravel(),
-                           Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
+                           Ex, Ey, Ez, Bx, By, Bz,
+                           prev_Ex, prev_Ey, prev_Ez, prev_Bx, prev_By, prev_Bz,
                            x_offt_new.ravel(), y_offt_new.ravel(),
                            px_new.ravel(), py_new.ravel(), pz_new.ravel())
     numba.cuda.synchronize()
@@ -779,7 +841,8 @@ def step(config, const, virt_params, prev, beam_ro):
         config, const.m, const.q, const.x_init, const.y_init,
         prev.x_offt, prev.y_offt, x_offt, y_offt, prev.px, prev.py, prev.pz,
         # no halfstep-averaged fields yet
-        prev.Ex, prev.Ey, prev.Ez, prev.Bx, prev.By, Bz_avg=0
+        prev.Ex, prev.Ey, prev.Ez, prev.Bx, prev.By, 0,
+        prev.Ex, prev.Ey, prev.Ez, prev.Bx, prev.By, 0
     )
     # Recalculate the plasma density and currents.
     ro, jx, jy, jz = deposit(
@@ -803,16 +866,18 @@ def step(config, const, virt_params, prev, beam_ro):
     # Bz = 0 for now
     Ex_avg = (Ex + prev.Ex) / 2
     Ey_avg = (Ey + prev.Ey) / 2
-    Ez_avg = (Ez + prev.Ez) / 2
+    # Ez_avg = (Ez + prev.Ez) / 2
     Bx_avg = (Bx + prev.Bx) / 2
     By_avg = (By + prev.By) / 2
+    # Bz_avg = (Bz + prev.Bz) / 2
 
     # Repeat the previous procedure using averaged fields.
     x_offt, y_offt, px, py, pz = move_smart(
         config, const.m, const.q, const.x_init, const.y_init,
         prev.x_offt, prev.y_offt, x_offt, y_offt,
         prev.px, prev.py, prev.pz,
-        Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg=0
+        Ex, Ey, Ez, Bx, By, 0,
+        prev.Ex, prev.Ey, prev.Ez, prev.Bx, prev.By, 0
     )
     ro, jx, jy, jz = deposit(config, const.ro_initial, x_offt, y_offt,
                              const.m, const.q, px, py, pz, virt_params)
@@ -829,18 +894,13 @@ def step(config, const, virt_params, prev, beam_ro):
 
     Ez = calculate_Ez(config, jx, jy)
     # Bz = 0 for now
-    Ex_avg = (Ex + prev.Ex) / 2
-    Ey_avg = (Ey + prev.Ey) / 2
-    Ez_avg = (Ez + prev.Ez) / 2
-    Bx_avg = (Bx + prev.Bx) / 2
-    By_avg = (By + prev.By) / 2
-
     # Repeat the previous procedure using averaged fields once again.
     x_offt, y_offt, px, py, pz = move_smart(
         config, const.m, const.q, const.x_init, const.y_init,
         prev.x_offt, prev.y_offt, x_offt, y_offt,
         prev.px, prev.py, prev.pz,
-        Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg=0
+        Ex, Ey, Ez, Bx, By, 0,
+        prev.Ex, prev.Ey, prev.Ez, prev.Bx, prev.By, 0
     )
     ro, jx, jy, jz = deposit(config, const.ro_initial, x_offt, y_offt,
                              const.m, const.q, px, py, pz, virt_params)
@@ -914,15 +974,17 @@ def diags_ro_zn(config, ro):
     return max_zn
 
 
-def diags_peak_msg(Ez_00_history):
+def diags_peak_msg(config, Ez_00_history):
     Ez_00_array = np.array(Ez_00_history)
     peak_indices = scipy.signal.argrelmax(Ez_00_array)[0]
 
     if peak_indices.size:
         peak_values = Ez_00_array[peak_indices]
         rel_deviations_perc = 100 * (peak_values / peak_values[0] - 1)
+        period = (peak_indices[-1] - peak_indices[0]) * config.xi_step_size / (len(peak_indices) - 1)
         return (f'{peak_values[-1]:0.4e} '
-                f'{rel_deviations_perc[-1]:+0.2f}%')
+                f'{rel_deviations_perc[-1]:+0.2f}% '
+                f'{period:+0.4f}')
     else:
         return '...'
 
@@ -942,7 +1004,7 @@ def diagnostics(view_state, config, xi_i, Ez_00_history):
     xi = -xi_i * config.xi_step_size
 
     Ez_00 = Ez_00_history[-1]
-    peak_report = diags_peak_msg(Ez_00_history)
+    peak_report = diags_peak_msg(config, Ez_00_history)
 
     ro = view_state.ro
     max_zn = diags_ro_zn(config, ro)
