@@ -18,7 +18,7 @@ field_solver_variant_A = True
 
 reflect_padding_steps = 5
 plasma_padding_steps = 10
-plasma_coarseness, plasma_fineness = 3, 2
+plasma_fineness = 2
 
 
 from numpy import cos, exp, pi, sqrt
