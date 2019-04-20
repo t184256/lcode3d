@@ -16,7 +16,7 @@
 # along with LCODE.  If not, see <http://www.gnu.org/licenses/>.
 
 
-from math import sqrt, floor
+from math import floor, sin, sqrt, pi
 
 import os
 import sys
@@ -570,12 +570,15 @@ def initial_deposition(config, x_init, y_init, x_offt, y_offt, px, py, pz, m, q)
 @numba.cuda.jit
 def move_smart_kernel(xi_step_size, reflect_boundary,
                       grid_step_size, grid_steps,
+                      noise_reductor,
+                      grid,
                       ms, qs,
                       x_init, y_init,
                       prev_x_offt, prev_y_offt,
                       estimated_x_offt, estimated_y_offt,
                       prev_px, prev_py, prev_pz,
                       Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
+                      ro,
                       new_x_offt, new_y_offt, new_px, new_py, new_pz):
     """
     Update plasma particle coordinates and momenta according to the field
@@ -606,6 +609,21 @@ def move_smart_kernel(xi_step_size, reflect_boundary,
     Bx = interp9(Bx_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
     By = interp9(By_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
     Bz = interp9(Bz_avg, i, j, wMP, w0P, wPP, wM0, w00, wP0, wMM, w0M, wPM)
+
+    # Density-based noise reductor
+    Ax = (+ (ro[i + 1, j - 1] + ro[i - 1, j - 1] - 2 * ro[i, j - 1]) / 4
+          + (ro[i + 1, j + 0] + ro[i - 1, j + 0] - 2 * ro[i, j + 0]) / 4
+          + (ro[i + 1, j + 1] + ro[i - 1, j + 1] - 2 * ro[i, j + 1]) / 4) / 3
+    x_i = grid[i]
+    dEx = Ax * grid_step_size * sin(pi * (x_halfstep - x_i) / grid_step_size) / pi
+    Ex += dEx * noise_reductor
+
+    Ay = (+ (ro[i - 1, j + 1] + ro[i - 1, j - 1] - 2 * ro[i - 1, j]) / 4
+          + (ro[i + 0, j + 1] + ro[i + 0, j - 1] - 2 * ro[i + 0, j]) / 4
+          + (ro[i + 1, j + 1] + ro[i + 1, j - 1] - 2 * ro[i + 1, j]) / 4) / 3
+    y_j = grid[j]
+    dEy = Ay * grid_step_size * sin(pi * (y_halfstep - y_j) / grid_step_size) / pi
+    Ey += dEy * noise_reductor
 
     # Move the particles according the the fields
     gamma_m = sqrt(m**2 + pz**2 + px**2 + py**2)
@@ -659,10 +677,11 @@ def move_smart_kernel(xi_step_size, reflect_boundary,
     new_px[k], new_py[k], new_pz[k] = px, py, pz
 
 
-def move_smart(config,
+def move_smart(config, grid,
                m, q, x_init, y_init, x_prev_offt, y_prev_offt,
                estimated_x_offt, estimated_y_offt, px_prev, py_prev, pz_prev,
-               Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg):
+               Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
+               ro):
     """
     Update plasma particle coordinates and momenta according to the field
     values interpolated halfway between the previous plasma particle location
@@ -677,12 +696,15 @@ def move_smart(config,
     cfg = int(np.ceil(x_init.size / WARP_SIZE)), WARP_SIZE
     move_smart_kernel[cfg](config.xi_step_size, config.reflect_boundary,
                            config.grid_step_size, config.grid_steps,
+                           config.noise_reductor,
+                           grid,
                            m.ravel(), q.ravel(),
                            x_init.ravel(), y_init.ravel(),
                            x_prev_offt.ravel(), y_prev_offt.ravel(),
                            estimated_x_offt.ravel(), estimated_y_offt.ravel(),
                            px_prev.ravel(), py_prev.ravel(), pz_prev.ravel(),
                            Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
+                           ro,
                            x_offt_new.ravel(), y_offt_new.ravel(),
                            px_new.ravel(), py_new.ravel(), pz_new.ravel())
     numba.cuda.synchronize()
@@ -709,10 +731,12 @@ def step(config, const, prev, beam_ro):
 
     # Interpolate fields in midpoint and move particles with previous fields.
     x_offt, y_offt, px, py, pz = move_smart(
-        config, const.m, const.q, const.x_init, const.y_init,
+        config, const.grid,
+        const.m, const.q, const.x_init, const.y_init,
         prev.x_offt, prev.y_offt, x_offt, y_offt, prev.px, prev.py, prev.pz,
         # no halfstep-averaged fields yet
-        prev.Ex, prev.Ey, prev.Ez, prev.Bx, prev.By, prev.Bz
+        prev.Ex, prev.Ey, prev.Ez, prev.Bx, prev.By, prev.Bz,
+        prev.ro + beam_ro
     )
     # Recalculate the plasma density and currents.
     ro, jx, jy, jz = deposit(
@@ -744,10 +768,12 @@ def step(config, const, prev, beam_ro):
 
     # Repeat the previous procedure using averaged fields.
     x_offt, y_offt, px, py, pz = move_smart(
-        config, const.m, const.q, const.x_init, const.y_init,
+        config, const.grid,
+        const.m, const.q, const.x_init, const.y_init,
         prev.x_offt, prev.y_offt, x_offt, y_offt,
         prev.px, prev.py, prev.pz,
-        Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg
+        Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
+        ro + beam_ro
     )
     ro, jx, jy, jz = deposit(
         config, const.ro_initial, const.x_init, const.y_init,
@@ -776,10 +802,12 @@ def step(config, const, prev, beam_ro):
 
     # Repeat the previous procedure using averaged fields once again.
     x_offt, y_offt, px, py, pz = move_smart(
-        config, const.m, const.q, const.x_init, const.y_init,
+        config, const.grid,
+        const.m, const.q, const.x_init, const.y_init,
         prev.x_offt, prev.y_offt, x_offt, y_offt,
         prev.px, prev.py, prev.pz,
-        Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg
+        Ex_avg, Ey_avg, Ez_avg, Bx_avg, By_avg, Bz_avg,
+        ro + beam_ro
     )
     ro, jx, jy, jz = deposit(
         config, const.ro_initial, const.x_init, const.y_init,
@@ -825,7 +853,9 @@ def init(config):
     ro_initial = initial_deposition(config, x_init, y_init, x_offt, y_offt,
                                     px, py, pz, m, q)
 
-    const = GPUArrays(m=m, q=q, x_init=x_init, y_init=y_init,
+    const = GPUArrays(m=m, q=q,
+                      grid=grid,
+                      x_init=x_init, y_init=y_init,
                       ro_initial=ro_initial)
 
     def zeros():
