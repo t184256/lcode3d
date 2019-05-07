@@ -18,21 +18,12 @@
 
 from math import sqrt, floor
 
-import os
-import sys
-
-import matplotlib.pyplot as plt
-
 import numpy as np
 
 import numba
 import numba.cuda
 
 import cupy as cp
-
-import scipy.ndimage
-import scipy.signal
-
 
 # Prevent all CPU cores waiting for the GPU at 100% utilization (under conda).
 # os.environ['OMP_NUM_THREADS'] = '1'
@@ -975,80 +966,39 @@ def init(config):
     return xs, ys, const, virt_params, state
 
 
-# Some really sloppy diagnostics #
+# Diagnostics helper #
 
-max_zn = 0
-def diags_ro_zn(config, ro):
-    global max_zn
+def savepng(dirname, prefix, xi, arr, **kwargs):
+    import matplotlib.pyplot as plt
+    import os
 
-    sigma = 0.25 / config.grid_step_size
-    blurred = scipy.ndimage.gaussian_filter(ro, sigma=sigma)
-    hf = ro - blurred
-    zn = np.abs(hf).mean() / 4.23045376e-04
-    max_zn = max(max_zn, zn)
-    return max_zn
+    if not os.path.isdir(dirname):
+        os.mkdir(dirname)
 
-
-def diags_peak_msg(Ez_00_history):
-    Ez_00_array = np.array(Ez_00_history)
-    peak_indices = scipy.signal.argrelmax(Ez_00_array)[0]
-
-    if peak_indices.size:
-        peak_values = Ez_00_array[peak_indices]
-        rel_deviations_perc = 100 * (peak_values / peak_values[0] - 1)
-        return (f'{peak_values[-1]:0.4e} '
-                f'{rel_deviations_perc[-1]:+0.2f}%')
-    else:
-        return '...'
-
-
-def diags_ro_slice(config, xi_i, xi, ro):
-    if xi_i % int(1 / config.xi_step_size):
-        return
-    if not os.path.isdir('transverse'):
-        os.mkdir('transverse')
-
-    fname = f'ro_{xi:+09.2f}.png' if xi else 'ro_-00000.00.png'
-    plt.imsave(os.path.join('transverse', fname), ro.T,
-               origin='lower', vmin=-0.1, vmax=0.1, cmap='bwr')
-
-
-def diagnostics(view_state, config, xi_i, Ez_00_history):
-    xi = -xi_i * config.xi_step_size
-
-    Ez_00 = Ez_00_history[-1]
-    peak_report = diags_peak_msg(Ez_00_history)
-
-    ro = view_state.ro
-    max_zn = diags_ro_zn(config, ro)
-    diags_ro_slice(config, xi_i, xi, ro)
-
-    print(f'xi={xi:+.4f} {Ez_00:+.4e}|{peak_report}|zn={max_zn:.3f}')
-    sys.stdout.flush()
+    fname = prefix + (f'_{xi:+09.2f}.png' if xi else '_-00000.00.png')
+    plt.imsave(os.path.join(dirname, fname), arr.T, origin='lower', **kwargs)
 
 
 # Main loop #
 
-def main():
-    import config
-    with cp.cuda.Device(config.gpu_index):
+def main(config=None):
+    if config is None:
+        import config
 
+    with cp.cuda.Device(config.gpu_index):
         xs, ys, const, virt_params, state = init(config)
-        Ez_00_history = []
 
         for xi_i in range(config.xi_steps):
             beam_ro = config.beam(xi_i, xs, ys)
 
             state = step(config, const, virt_params, state, beam_ro)
-            view_state = GPUArraysView(state)
-
-            ez = view_state.Ez[config.grid_steps // 2, config.grid_steps // 2]
-            Ez_00_history.append(ez)
 
             time_for_diags = xi_i % config.diagnostics_each_N_steps == 0
             last_step = xi_i == config.xi_steps - 1
             if time_for_diags or last_step:
-                diagnostics(view_state, config, xi_i, Ez_00_history)
+                wrap = config.diagnostics_wants_numpy_arrays
+                config.diagnostics(config, xi_i,
+                                   GPUArraysView(state) if wrap else state)
 
 
 if __name__ == '__main__':

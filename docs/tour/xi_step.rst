@@ -91,3 +91,18 @@ The result, or the 'new prev'
 The fields from 7., coordinates and momenta from 8., and densities from 9.
 make up the new ``GPUArrays`` collection that would be passed as ``prev``
 to the next iteration of :func:`step()`.
+
+
+Looping it
+----------
+.. autofunction:: lcode.main
+
+   The main loop doesn't do much fancy stuff.
+   It initializes the constant arrays and the initial state,
+   feeds it into :func:`lcode.step` repeatedly and
+   calls diagnostics every :data:`config_example.diagnostics_each_N_steps` steps
+   and after the last step.
+
+   Feel free to rewrite/replace it for embedding purposes.
+
+.. autodata:: config_example.diagnostics_each_N_steps

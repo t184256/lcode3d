@@ -116,7 +116,14 @@ but beware!
    so one should bind it to the variable name (``x_init = const_view.x_init``) once
    and reuse the resulting ``numpy`` array.
 
-.. todo:: CODE: wrap the returned array with GPUArraysView by default
+.. autodata:: config_example.diagnostics_wants_numpy_arrays
+
+   When this option is on, func:`config_example.diagnostics` will receive GPUArraysView
+   that will perform the conversion to numpy arrays transparently.
+   Disable this if
+   you want to run your diagnostics on GPU as well,
+   you know what you are doing
+   and your diagnostics function is GPU-aware.
 
 
 Selecting GPU
