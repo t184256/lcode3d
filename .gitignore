@@ -27,3 +27,4 @@
 /transverse*/
 __pycache__/
 /docs/index.rst
+/docs/_build
